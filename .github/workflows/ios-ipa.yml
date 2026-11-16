@@ -1,0 +1,99 @@
+name: Build Unsigned iOS IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      api_url:
+        description: "API base URL baked into the app (EXPO_PUBLIC_API_URL)"
+        required: true
+        default: "https://your-api.example.com"
+
+permissions:
+  contents: read
+
+jobs:
+  ipa:
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      CI: "1"
+      EXPO_PUBLIC_API_URL: ${{ inputs.api_url }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.19.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Show Xcode version
+        run: |
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          xcodebuild -version
+          xcrun simctl list runtimes
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: |
+          pnpm exec tsc -p tsconfig.json --noEmit
+          pnpm exec tsc -p apps/mobile/tsconfig.json --noEmit
+
+      - name: Expo prebuild (iOS)
+        working-directory: apps/mobile
+        run: pnpm exec expo prebuild --platform ios --clean --no-install
+
+      - name: Install CocoaPods
+        working-directory: apps/mobile/ios
+        run: pod install --repo-update
+
+      - name: Build unsigned archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORKSPACE="$(find apps/mobile/ios -maxdepth 1 -name '*.xcworkspace' -print -quit)"
+          test -n "$WORKSPACE"
+          SCHEME="$(xcodebuild -workspace "$WORKSPACE" -list | awk -F': ' '/Schemes:/{getline; gsub(/^[ \t]+/, ""); print; exit}')"
+          test -n "$SCHEME"
+          echo "Workspace=$WORKSPACE"
+          echo "Scheme=$SCHEME"
+          echo "EXPO_PUBLIC_API_URL=$EXPO_PUBLIC_API_URL"
+          xcodebuild \
+            -workspace "$WORKSPACE" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -archivePath "$RUNNER_TEMP/OpenMuse.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            archive
+
+      - name: Package unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="$(find "$RUNNER_TEMP/OpenMuse.xcarchive/Products/Applications" -maxdepth 1 -name '*.app' -print -quit)"
+          test -n "$APP"
+          rm -rf "$RUNNER_TEMP/Payload-for-openmuse"
+          mkdir -p "$RUNNER_TEMP/Payload-for-openmuse/Payload"
+          cp -R "$APP" "$RUNNER_TEMP/Payload-for-openmuse/Payload/"
+          cd "$RUNNER_TEMP/Payload-for-openmuse"
+          ditto -c -k --sequesterRsrc --keepParent Payload "$GITHUB_WORKSPACE/OpenMuse-unsigned.ipa"
+          ls -lh "$GITHUB_WORKSPACE/OpenMuse-unsigned.ipa"
+          shasum -a 256 "$GITHUB_WORKSPACE/OpenMuse-unsigned.ipa"
+          unzip -l "$GITHUB_WORKSPACE/OpenMuse-unsigned.ipa" | head -n 30
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenMuse-unsigned-ipa
+          path: OpenMuse-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
