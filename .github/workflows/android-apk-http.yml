@@ -1,0 +1,98 @@
+name: Build Android APK (HTTP API)
+
+on:
+  workflow_dispatch:
+    inputs:
+      api_url:
+        description: "HTTP(S) API base URL baked into the app"
+        required: true
+        default: "http://47.103.47.74:25312"
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CI: "1"
+      EXPO_PUBLIC_API_URL: ${{ inputs.api_url }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.19.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install Android SDK
+        run: |
+          set -e
+          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          SDKM="$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin 2>/dev/null | head -1)"
+          export PATH="$SDKM:$ANDROID_HOME/platform-tools:$PATH"
+          which sdkmanager
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager --install "platforms;android-36" "build-tools;36.0.0" \
+            "ndk;27.1.12297006" "cmake;3.22.1" 2>&1 | tail -3
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: |
+          pnpm exec tsc -p tsconfig.json --noEmit
+          pnpm exec tsc -p apps/mobile/tsconfig.json --noEmit
+
+      - name: Expo prebuild (Android)
+        working-directory: apps/mobile
+        run: pnpm exec expo prebuild --platform android --clean --no-install
+
+      - name: Allow configured HTTP API
+        shell: bash
+        run: |
+          set -euo pipefail
+          MANIFEST="apps/mobile/android/app/src/main/AndroidManifest.xml"
+          test -f "$MANIFEST"
+          sed -i 's/<application /<application android:usesCleartextTraffic="true" /' "$MANIFEST"
+          grep -n "usesCleartextTraffic" "$MANIFEST"
+
+      - name: Build APK
+        working-directory: apps/mobile/android
+        run: |
+          set -e
+          echo "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g" >> gradle.properties
+          echo "reactNativeArchitectures=arm64-v8a" >> gradle.properties
+          echo "EXPO_PUBLIC_API_URL=$EXPO_PUBLIC_API_URL"
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Collect APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="$(find apps/mobile/android/app/build/outputs/apk/release -name '*.apk' -print -quit)"
+          test -n "$APK"
+          mkdir -p out
+          cp "$APK" out/OpenMuse-api-arm64.apk
+          ls -lh out
+          sha256sum out/OpenMuse-api-arm64.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenMuse-api-apk
+          path: out/OpenMuse-api-arm64.apk
+          if-no-files-found: error
+          retention-days: 14
